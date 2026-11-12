@@ -9,7 +9,7 @@ Déploiement d'un cluster Docker Swarm sur des VM Debian pour assurer la continu
 | Nœud   | Rôle                         | IP           |
 |--------|------------------------------|--------------|
 | Noeud1 | Manager                      | 10.60.8.99   |
-| Noeud2 | Manager                      | 10.60.8.x    |
+| Noeud2 | Manager                      | 10.60.8.100  |
 | Noeud3 | Manager + serveur NFS        | 10.60.8.101  |
 
 - **3 managers** : tolérance à la perte d'un manager (quorum Raft 2/3).
@@ -123,6 +123,158 @@ Les services les lisent via `/run/secrets/<nom>` :
 
 ## 6. Déploiement du stack
 
+### Fichier `stack.yml`
+```yaml
+version: "3.8"
+
+services:
+
+  registry:
+    image: registry:2
+    ports:
+      - "5000:5000"
+    volumes:
+      - registry_data:/var/lib/registry
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
+  mariadb:
+    image: mariadb:11
+    environment:
+      MARIADB_ROOT_PASSWORD_FILE: /run/secrets/db_root_password
+      MARIADB_DATABASE: appdb
+      MARIADB_USER: appuser
+      MARIADB_PASSWORD_FILE: /run/secrets/db_password
+    secrets:
+      - db_root_password
+      - db_password
+    volumes:
+      - mariadb_data:/var/lib/mysql
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
+  php:
+    image: php:8.3-fpm
+    command: sh -c "docker-php-ext-install mysqli pdo_mysql && php-fpm"
+    secrets:
+      - db_password
+    volumes:
+      - web_data:/var/www/html
+    networks:
+      - backend
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: any
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - web_data:/var/www/html
+    networks:
+      - backend
+    command:
+      - sh
+      - -c
+      - |
+        cat > /etc/nginx/conf.d/default.conf <<'EOF'
+        server {
+          listen 80;
+          root /var/www/html;
+          index index.php index.html;
+          location / { try_files $$uri $$uri/ /index.php?$$query_string; }
+          location ~ \.php$$ {
+            fastcgi_pass php:9000;
+            include fastcgi_params;
+            fastcgi_param SCRIPT_FILENAME $$document_root$$fastcgi_script_name;
+          }
+        }
+        EOF
+        exec nginx -g 'daemon off;'
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: any
+
+  vscode:
+    image: lscr.io/linuxserver/code-server:latest
+    environment:
+      PUID: "1000"
+      PGID: "1000"
+      TZ: Europe/Paris
+      FILE__PASSWORD: /run/secrets/vscode_password
+      DEFAULT_WORKSPACE: /config/workspace
+    secrets:
+      - vscode_password
+    ports:
+      - "8443:8443"
+    volumes:
+      - vscode_data:/config
+      - web_data:/config/workspace
+    networks:
+      - backend
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: any
+
+secrets:
+  db_root_password:
+    external: true
+  db_password:
+    external: true
+  vscode_password:
+    external: true
+
+networks:
+  backend:
+    driver: overlay
+    attachable: true
+
+volumes:
+  registry_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=10.60.8.101,rw,nfsvers=4"
+      device: ":/srv/nfs/swarm/registry"
+  mariadb_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=10.60.8.101,rw,nfsvers=4"
+      device: ":/srv/nfs/swarm/mariadb"
+  web_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=10.60.8.101,rw,nfsvers=4"
+      device: ":/srv/nfs/swarm/web"
+  vscode_data:
+    driver: local
+    driver_opts:
+      type: nfs
+      o: "addr=10.60.8.101,rw,nfsvers=4"
+      device: ":/srv/nfs/swarm/vscode"
+```
+
+Points clés :
+- `restart_policy: any` : Swarm relance automatiquement tout conteneur arrêté.
+- PHP et Nginx en **2 réplicas** : répartition de charge et tolérance à la perte d'un conteneur.
+- La configuration Nginx est générée au démarrage (`$$` = `$` échappé pour Compose), ce qui permet de tout garder dans un seul fichier.
+- Les volumes sont montés en **NFS** depuis Noeud3 : un conteneur recréé sur n'importe quel nœud retrouve ses données.
+
+### Déploiement
 ```bash
 cd ~/swarm
 docker stack deploy -c stack.yml swarm
